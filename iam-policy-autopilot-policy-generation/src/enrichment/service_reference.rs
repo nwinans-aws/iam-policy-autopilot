@@ -319,7 +319,6 @@ fn deserialize_service_reference_mapping(
 /// with exact service name matching and thread-safe caching. Service names
 /// must match exactly between input and Service Reference Name (case-sensitive).
 #[derive(Debug)]
-
 pub(crate) struct RemoteServiceReferenceLoader {
     client: Client,
     /// The index mapping; refreshed by `refresh_index()` before each enrichment run.
@@ -372,7 +371,6 @@ impl RemoteServiceReferenceLoader {
     /// Sets a custom mapping URL (e.g., a mock server) and resets the cached mapping
     /// so the next call fetches from the new URL.
     #[cfg(test)]
-
     pub(crate) fn with_mapping_url(mut self, url: String) -> Self {
         self.mapping_url = url;
         self.service_reference_mapping = RwLock::new(None);
@@ -541,8 +539,8 @@ impl RemoteServiceReferenceLoader {
     }
 
     async fn read_cached_modified(service_name: &str) -> Option<u64> {
-        let meta_path = Self::get_cache_modified_path(service_name);
-        let content = fs::read_to_string(&meta_path).await.ok()?;
+        let modified_path = Self::get_cache_modified_path(service_name);
+        let content = fs::read_to_string(&modified_path).await.ok()?;
         content.trim().parse().ok()
     }
 
@@ -893,24 +891,24 @@ mod tests {
         // setup_mock_server_with_loader disables file system cache by default
         loader.disable_file_system_cache = false;
         let cache_path = RemoteServiceReferenceLoader::get_cache_path("s3");
-        let meta_path = RemoteServiceReferenceLoader::get_cache_modified_path("s3");
+        let modified_path = RemoteServiceReferenceLoader::get_cache_modified_path("s3");
         let _ = fs::remove_file(&cache_path).await;
-        let _ = fs::remove_file(&meta_path).await;
+        let _ = fs::remove_file(&modified_path).await;
 
         let result = loader.load("s3").await;
         assert!(result.is_ok());
         assert!(cache_path.exists());
-        assert!(meta_path.exists());
+        assert!(modified_path.exists());
 
         let cached_content = fs::read_to_string(&cache_path).await;
         assert!(cached_content.is_ok());
-        let meta_content = fs::read_to_string(&meta_path).await;
-        assert!(meta_content.is_ok());
+        let modified_content = fs::read_to_string(&modified_path).await;
+        assert!(modified_content.is_ok());
         // modified should be parseable as u64
-        assert!(meta_content.unwrap().trim().parse::<u64>().is_ok());
+        assert!(modified_content.unwrap().trim().parse::<u64>().is_ok());
 
         let _ = fs::remove_file(&cache_path).await;
-        let _ = fs::remove_file(&meta_path).await;
+        let _ = fs::remove_file(&modified_path).await;
     }
 
     #[tokio::test]
