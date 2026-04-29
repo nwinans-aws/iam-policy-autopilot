@@ -878,19 +878,13 @@ mod tests {
     #[tokio::test]
     async fn test_get_cache_path() {
         let cache_path = RemoteServiceReferenceLoader::get_cache_path("s3");
-        assert!(
-            cache_path.ends_with("IAMPolicyAutopilot/s3.json")
-                || cache_path.ends_with("IAMAutoPilot\\s3.json")
-        );
+        assert!(cache_path.ends_with("IAMPolicyAutopilot/s3.json"));
     }
 
     #[tokio::test]
     async fn test_get_cache_modified_path() {
         let modified_path = RemoteServiceReferenceLoader::get_cache_modified_path("s3");
-        assert!(
-            modified_path.ends_with("IAMPolicyAutopilot/s3.modified")
-                || modified_path.ends_with("IAMAutoPilot\\s3.modified")
-        );
+        assert!(modified_path.ends_with("IAMPolicyAutopilot/s3.modified"));
     }
 
     #[tokio::test]
