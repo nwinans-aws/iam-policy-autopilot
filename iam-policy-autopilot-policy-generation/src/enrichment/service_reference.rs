@@ -21,10 +21,6 @@ use tokio::sync::RwLock;
 type OperationName = String;
 const IAM_POLICY_AUTOPILOT: &str = "IAMPolicyAutopilot";
 
-/// Environment variable to throttle index refreshes. When set to a number of
-/// seconds, `refresh_index()` becomes a no-op if the index was already fetched
-/// within that window. Unset (the default) means refresh every invocation.
-const REFRESH_INTERVAL_ENV: &str = "IAM_POLICY_AUTOPILOT_REFRESH_INTERVAL_SECONDS";
 /// Service Reference data structure
 ///
 /// Represents the complete service reference loaded from service reference endpoint.
@@ -290,6 +286,8 @@ fn deserialize_service_reference_mapping(
     struct ServiceEntry {
         service: String,
         url: String,
+        /// Defaults to 0 for backward compatibility with index entries that
+        /// predate the `modified` field.
         #[serde(default)]
         modified: u64,
     }
@@ -326,10 +324,16 @@ pub(crate) struct RemoteServiceReferenceLoader {
     client: Client,
     /// The index mapping; refreshed by `refresh_index()` before each enrichment run.
     service_reference_mapping: RwLock<Option<ServiceReferenceMapping>>,
-    /// In-memory cache keyed by service name → (data, modified timestamp from index).
+    /// In-memory cache: service name → (parsed data, `modified` timestamp from the index).
+    /// Entries are evicted by `refresh_index()` when the remote `modified` increases.
     service_cache: RwLock<HashMap<String, (ServiceReference, u64)>>,
-    /// Tracks when the index was last refreshed, for optional throttling.
+    /// When the index was last successfully fetched. Used together with
+    /// `refresh_interval` to skip redundant network calls.
     last_refreshed: RwLock<Option<SystemTime>>,
+    /// Optional minimum interval between index refreshes. When `Some`, `refresh_index()`
+    /// is a no-op if the index was already fetched within this window. `None` (the default)
+    /// means refresh every invocation.
+    refresh_interval: Option<Duration>,
     mapping_url: String,
     disable_file_system_cache: bool,
 }
@@ -341,6 +345,7 @@ impl RemoteServiceReferenceLoader {
             service_reference_mapping: RwLock::new(None),
             service_cache: RwLock::new(HashMap::new()),
             last_refreshed: RwLock::new(None),
+            refresh_interval: None,
             mapping_url: "https://servicereference.us-east-1.amazonaws.com".to_string(),
             disable_file_system_cache,
         })
@@ -349,7 +354,6 @@ impl RemoteServiceReferenceLoader {
     /// Creates a loader that always returns `None` for any service.
     /// Useful in tests that don't need real SDF data.
     #[cfg(test)]
-
     pub(crate) fn empty_loader_for_tests() -> crate::errors::Result<Self> {
         let loader = Self {
             client: Self::create_client()?,
@@ -358,6 +362,7 @@ impl RemoteServiceReferenceLoader {
             })),
             service_cache: RwLock::new(HashMap::new()),
             last_refreshed: RwLock::new(None),
+            refresh_interval: None,
             mapping_url: String::new(),
             disable_file_system_cache: true,
         };
@@ -372,6 +377,15 @@ impl RemoteServiceReferenceLoader {
         self.mapping_url = url;
         self.service_reference_mapping = RwLock::new(None);
         self.last_refreshed = RwLock::new(None);
+        self
+    }
+
+    /// Sets the minimum interval between index refreshes. When set,
+    /// `refresh_index()` is a no-op if the index was already fetched
+    /// within this window.
+    #[cfg(test)]
+    pub(crate) fn with_refresh_interval(mut self, interval: Duration) -> Self {
+        self.refresh_interval = Some(interval);
         self
     }
 
@@ -432,18 +446,15 @@ impl RemoteServiceReferenceLoader {
     /// `modified` timestamp has increased. Call once per invocation, before
     /// the enrichment loop.
     ///
-    /// When `IAM_POLICY_AUTOPILOT_REFRESH_INTERVAL_SECONDS` is set, the
-    /// refresh is skipped if the index was already fetched within that window.
+    /// When `refresh_interval` is set, the refresh is skipped if the index
+    /// was already fetched within that window.
     pub(crate) async fn refresh_index(&self) -> crate::errors::Result<()> {
-        // Check optional throttle
-        if let Ok(val) = std::env::var(REFRESH_INTERVAL_ENV) {
-            if let Ok(secs) = val.parse::<u64>() {
-                let last = *self.last_refreshed.read().await;
-                if let Some(last) = last {
-                    if let Ok(elapsed) = SystemTime::now().duration_since(last) {
-                        if elapsed < Duration::from_secs(secs) {
-                            return Ok(());
-                        }
+        // Skip if the index was recently refreshed and an interval is configured
+        if let Some(interval) = self.refresh_interval {
+            if let Some(last) = *self.last_refreshed.read().await {
+                if let Ok(elapsed) = SystemTime::now().duration_since(last) {
+                    if elapsed < interval {
+                        return Ok(());
                     }
                 }
             }
@@ -516,6 +527,9 @@ impl RemoteServiceReferenceLoader {
         Self::get_cache_dir().join(format!("{service_name}.json"))
     }
 
+    /// Path to the `.modified` sidecar for a cached service. Each service gets
+    /// its own sidecar rather than a single index file so that individual
+    /// entries can be written/evicted independently without locking a shared file.
     fn get_cache_meta_path(service_name: &str) -> PathBuf {
         Self::get_cache_dir().join(format!("{service_name}.modified"))
     }
@@ -538,57 +552,102 @@ impl RemoteServiceReferenceLoader {
         }
     }
 
+    /// Load a service reference by name.
+    ///
+    /// Tries three sources in order:
+    /// 1. In-memory cache (already validated by `refresh_index`)
+    /// 2. Filesystem cache (validated against the index `modified` timestamp)
+    /// 3. Remote fetch (updates both caches)
+    ///
+    /// If `refresh_index()` has not been called yet (e.g. callers outside the
+    /// enrichment path like Terraform resource resolution), the index is lazily
+    /// fetched here so the caller doesn't need to remember to call it.
     pub(crate) async fn load(
         &self,
         service_name: &str,
     ) -> crate::errors::Result<Option<ServiceReference>> {
-        // Check in-memory cache (already validated by refresh_index)
-        if let Some((cached, _)) = self.service_cache.read().await.get(service_name) {
-            return Ok(Some(cached.clone()));
+        if let Some(hit) = self.load_from_memory_cache(service_name).await {
+            return Ok(Some(hit));
         }
 
-        // Lazily initialize the mapping if refresh_index() hasn't been called yet
-        {
-            let needs_init = self.service_reference_mapping.read().await.is_none();
-            if needs_init {
-                let fresh = self.fetch_mapping().await?;
-                *self.service_reference_mapping.write().await = Some(fresh);
-            }
-        }
+        self.ensure_mapping_initialized().await?;
 
-        // Resolve the entry from the index
-        let mapping_guard = self.service_reference_mapping.read().await;
-        let mapping = match mapping_guard.as_ref() {
-            Some(m) => m,
+        let entry = match self.resolve_index_entry(service_name).await {
+            Some(e) => e,
             None => return Ok(None),
         };
-        let entry = match mapping.service_reference_mapping.get(service_name) {
-            Some(e) => e.clone(),
-            None => return Ok(None),
-        };
-        drop(mapping_guard);
 
-        // Check filesystem cache
-        if !self.disable_file_system_cache {
-            let cache_path = Self::get_cache_path(service_name);
-            if let Some(cached_modified) = Self::read_cached_modified(service_name).await {
-                if cached_modified >= entry.modified {
-                    if let Ok(content) = fs::read_to_string(&cache_path).await {
-                        if let Ok(service_ref) =
-                            JsonProvider::parse::<ServiceReference>(&content).await
-                        {
-                            self.service_cache.write().await.insert(
-                                service_name.to_string(),
-                                (service_ref.clone(), cached_modified),
-                            );
-                            return Ok(Some(service_ref));
-                        }
-                    }
-                }
-            }
+        if let Some(hit) = self.load_from_filesystem_cache(service_name, &entry).await {
+            return Ok(Some(hit));
         }
 
-        // Fetch from remote
+        self.fetch_and_cache_service(service_name, &entry).await
+    }
+
+    /// Returns the cached `ServiceReference` if present in the in-memory cache.
+    async fn load_from_memory_cache(&self, service_name: &str) -> Option<ServiceReference> {
+        self.service_cache
+            .read()
+            .await
+            .get(service_name)
+            .map(|(cached, _)| cached.clone())
+    }
+
+    /// Lazily initializes the index mapping if `refresh_index()` hasn't been
+    /// called yet. This ensures callers outside the enrichment path (e.g.
+    /// Terraform resource resolution) don't need to explicitly call
+    /// `refresh_index()` first.
+    async fn ensure_mapping_initialized(&self) -> crate::errors::Result<()> {
+        if self.service_reference_mapping.read().await.is_none() {
+            let fresh = self.fetch_mapping().await?;
+            *self.service_reference_mapping.write().await = Some(fresh);
+        }
+        Ok(())
+    }
+
+    /// Looks up the service in the index mapping. Returns `None` if the
+    /// mapping is empty (should not happen after `ensure_mapping_initialized`)
+    /// or the service is not listed in the index.
+    async fn resolve_index_entry(&self, service_name: &str) -> Option<ServiceReferenceEntry> {
+        let guard = self.service_reference_mapping.read().await;
+        guard
+            .as_ref()
+            .and_then(|m| m.service_reference_mapping.get(service_name).cloned())
+    }
+
+    /// Attempts to load from the filesystem cache. Returns `Some` only when
+    /// the cached `modified` timestamp is still current.
+    async fn load_from_filesystem_cache(
+        &self,
+        service_name: &str,
+        entry: &ServiceReferenceEntry,
+    ) -> Option<ServiceReference> {
+        if self.disable_file_system_cache {
+            return None;
+        }
+        let cached_modified = Self::read_cached_modified(service_name).await?;
+        if cached_modified < entry.modified {
+            return None;
+        }
+        let cache_path = Self::get_cache_path(service_name);
+        let content = fs::read_to_string(&cache_path).await.ok()?;
+        let service_ref = JsonProvider::parse::<ServiceReference>(&content)
+            .await
+            .ok()?;
+        self.service_cache.write().await.insert(
+            service_name.to_string(),
+            (service_ref.clone(), cached_modified),
+        );
+        Some(service_ref)
+    }
+
+    /// Fetches the service reference from the remote URL and updates both
+    /// the in-memory and filesystem caches.
+    async fn fetch_and_cache_service(
+        &self,
+        service_name: &str,
+        entry: &ServiceReferenceEntry,
+    ) -> crate::errors::Result<Option<ServiceReference>> {
         let service_reference_content = self
             .client
             .get(entry.url.as_ref())
@@ -709,10 +768,10 @@ mod tests {
             entry.1 = 0; // very old timestamp
         }
 
-        // refresh_index should evict the stale entry since mock returns modified=0 by default
-        // but our cached value is also 0, so it won't evict. Let's update the mapping to have
-        // a higher modified value by re-fetching (the mock always returns the same).
-        // Instead, verify that load() still works after cache is populated.
+        // The mock always returns modified=1000, and we just set the cached
+        // timestamp to 0, so refresh_index would evict it. However, this test
+        // simply verifies that load() still returns correct data after the
+        // in-memory cache entry has been tampered with.
         let result = loader.load("s3").await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().unwrap().service_name, "s3");
@@ -1051,7 +1110,6 @@ mod tests {
 #[cfg(test)]
 mod integ_tests {
     use super::*;
-    use serial_test::serial;
     use std::time::{Duration, SystemTime};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1070,7 +1128,6 @@ mod integ_tests {
     /// 2. Refresh with same modified → cache stays, no re-fetch
     /// 3. Refresh with bumped modified → cache evicted, next load re-fetches
     #[tokio::test]
-    #[serial]
     async fn test_modified_based_cache_invalidation() {
         let server = MockServer::start().await;
         let url = server.uri();
@@ -1146,16 +1203,13 @@ mod integ_tests {
         );
     }
 
-    /// Tests the env-var-based refresh throttle on a single mock server:
-    /// 1. No env var → always refreshes
+    /// Tests the refresh interval behavior on a single mock server:
+    /// 1. No interval → always refreshes
     /// 2. Long interval → skips refresh
     /// 3. Expired interval → refreshes again
     /// 4. Interval of 0 → always refreshes
     #[tokio::test]
-    #[serial]
-    async fn test_refresh_throttle_behavior() {
-        std::env::remove_var(REFRESH_INTERVAL_ENV);
-
+    async fn test_refresh_interval_behavior() {
         let server = MockServer::start().await;
         let url = server.uri();
 
@@ -1167,28 +1221,33 @@ mod integ_tests {
             .mount(&server)
             .await;
 
+        // --- No interval: every call fetches ---
         let loader = RemoteServiceReferenceLoader::new(true)
             .unwrap()
-            .with_mapping_url(url);
+            .with_mapping_url(url.clone());
 
-        // --- No env var: every call fetches ---
         loader.refresh_index().await.unwrap();
         loader.refresh_index().await.unwrap();
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(
             index_request_count(&reqs),
             2,
-            "no env var → should fetch every time"
+            "no interval → should fetch every time"
         );
 
         // --- Long interval: skip ---
-        std::env::set_var(REFRESH_INTERVAL_ENV, "3600");
+        let loader = RemoteServiceReferenceLoader::new(true)
+            .unwrap()
+            .with_mapping_url(url.clone())
+            .with_refresh_interval(Duration::from_secs(3600));
+
+        loader.refresh_index().await.unwrap();
         loader.refresh_index().await.unwrap();
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(
             index_request_count(&reqs),
-            2,
-            "within 3600s window → should skip"
+            3,
+            "within 3600s window → second call should skip"
         );
 
         // --- Backdate last_refreshed so interval is expired ---
@@ -1197,20 +1256,23 @@ mod integ_tests {
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(
             index_request_count(&reqs),
-            3,
+            4,
             "expired interval → should fetch"
         );
 
         // --- Interval of 0: always fetches ---
-        std::env::set_var(REFRESH_INTERVAL_ENV, "0");
+        let loader = RemoteServiceReferenceLoader::new(true)
+            .unwrap()
+            .with_mapping_url(url)
+            .with_refresh_interval(Duration::from_secs(0));
+
+        loader.refresh_index().await.unwrap();
         loader.refresh_index().await.unwrap();
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(
             index_request_count(&reqs),
-            4,
+            6,
             "interval=0 → should always fetch"
         );
-
-        std::env::remove_var(REFRESH_INTERVAL_ENV);
     }
 }
