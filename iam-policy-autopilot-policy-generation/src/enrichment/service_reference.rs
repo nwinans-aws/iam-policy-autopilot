@@ -463,7 +463,12 @@ impl RemoteServiceReferenceLoader {
 
         let new_mapping = self.fetch_mapping().await?;
 
-        // Evict stale entries from in-memory and filesystem caches
+        // Evict entries whose `modified` timestamp in the new index is greater
+        // than the `cached_modified` we stored when the entry was last fetched.
+        // After eviction, the next `load()` call will re-fetch from remote.
+        // (`last_refreshed` tracks when *this index fetch* happened, for
+        // refresh-interval gating; `cached_modified` tracks the per-service
+        // version from the index, for staleness detection.)
         let mut cache = self.service_cache.write().await;
         let stale_services: Vec<String> = cache
             .iter()
@@ -480,7 +485,7 @@ impl RemoteServiceReferenceLoader {
             cache.remove(name);
             if !self.disable_file_system_cache {
                 let _ = fs::remove_file(Self::get_cache_path(name)).await;
-                let _ = fs::remove_file(Self::get_cache_meta_path(name)).await;
+                let _ = fs::remove_file(Self::get_cache_modified_path(name)).await;
             }
         }
         drop(cache);
@@ -531,12 +536,12 @@ impl RemoteServiceReferenceLoader {
     /// Path to the `.modified` sidecar for a cached service. Each service gets
     /// its own sidecar rather than a single index file so that individual
     /// entries can be written/evicted independently without locking a shared file.
-    fn get_cache_meta_path(service_name: &str) -> PathBuf {
+    fn get_cache_modified_path(service_name: &str) -> PathBuf {
         Self::get_cache_dir().join(format!("{service_name}.modified"))
     }
 
     async fn read_cached_modified(service_name: &str) -> Option<u64> {
-        let meta_path = Self::get_cache_meta_path(service_name);
+        let meta_path = Self::get_cache_modified_path(service_name);
         let content = fs::read_to_string(&meta_path).await.ok()?;
         content.trim().parse().ok()
     }
@@ -685,7 +690,7 @@ impl RemoteServiceReferenceLoader {
             let cache_path = Self::get_cache_path(service_name);
             let _ = fs::write(&cache_path, &service_reference_content).await;
             let _ = fs::write(
-                &Self::get_cache_meta_path(service_name),
+                &Self::get_cache_modified_path(service_name),
                 entry.modified.to_string(),
             )
             .await;
@@ -760,22 +765,30 @@ mod tests {
         let result = loader.load("s3").await;
         assert!(result.is_ok());
 
-        // Verify cache is populated
+        // Verify cache is populated with modified=1000 (from mock)
         let cached = loader.service_cache.read().await.get("s3").cloned();
         assert!(cached.is_some());
+        assert_eq!(cached.unwrap().1, 1000);
 
-        // Manually set a stale modified timestamp so refresh_index will evict it
+        // Manually set a stale modified timestamp so refresh_index will evict it.
+        // The mock index returns modified=1000, so setting cached to 0 means
+        // 1000 > 0 → stale → evicted.
         if let Some(entry) = loader.service_cache.write().await.get_mut("s3") {
-            entry.1 = 0; // very old timestamp
+            entry.1 = 0;
         }
 
-        // The mock always returns modified=1000, and we just set the cached
-        // timestamp to 0, so refresh_index would evict it. However, this test
-        // simply verifies that load() still returns correct data after the
-        // in-memory cache entry has been tampered with.
+        // refresh_index should evict the stale entry
+        loader.refresh_index().await.unwrap();
+        assert!(
+            loader.service_cache.read().await.get("s3").is_none(),
+            "stale entry should be evicted after refresh_index"
+        );
+
+        // load() should re-fetch and re-populate the cache
         let result = loader.load("s3").await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().unwrap().service_name, "s3");
+        assert!(loader.service_cache.read().await.get("s3").is_some());
     }
 
     // Integration test - requires network access
@@ -872,11 +885,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_cache_meta_path() {
-        let meta_path = RemoteServiceReferenceLoader::get_cache_meta_path("s3");
+    async fn test_get_cache_modified_path() {
+        let modified_path = RemoteServiceReferenceLoader::get_cache_modified_path("s3");
         assert!(
-            meta_path.ends_with("IAMPolicyAutopilot/s3.modified")
-                || meta_path.ends_with("IAMAutoPilot\\s3.modified")
+            modified_path.ends_with("IAMPolicyAutopilot/s3.modified")
+                || modified_path.ends_with("IAMAutoPilot\\s3.modified")
         );
     }
 
@@ -886,7 +899,7 @@ mod tests {
         // setup_mock_server_with_loader disables file system cache by default
         loader.disable_file_system_cache = false;
         let cache_path = RemoteServiceReferenceLoader::get_cache_path("s3");
-        let meta_path = RemoteServiceReferenceLoader::get_cache_meta_path("s3");
+        let meta_path = RemoteServiceReferenceLoader::get_cache_modified_path("s3");
         let _ = fs::remove_file(&cache_path).await;
         let _ = fs::remove_file(&meta_path).await;
 

@@ -68,6 +68,10 @@ impl Engine {
             .await?;
 
         let resource_matcher = ResourceMatcher::new(service_cfg, fas_maps, sdk);
+        // Refresh the service reference index once before the enrichment loop
+        // so stale cache entries are evicted up front. Individual services are
+        // then lazily fetched by load() only when actually needed during
+        // enrichment — unchanged services are never re-downloaded.
         if let Err(e) = self.service_reference_loader.refresh_index().await {
             log::warn!("Failed to refresh service reference index, will use cached data: {e}");
         }
