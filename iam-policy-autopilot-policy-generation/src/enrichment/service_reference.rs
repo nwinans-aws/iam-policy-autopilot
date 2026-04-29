@@ -451,7 +451,8 @@ impl RemoteServiceReferenceLoader {
     pub(crate) async fn refresh_index(&self) -> crate::errors::Result<()> {
         // Skip if the index was recently refreshed and an interval is configured
         if let Some(interval) = self.refresh_interval {
-            if let Some(last) = *self.last_refreshed.read().await {
+            let last = *self.last_refreshed.read().await;
+            if let Some(last) = last {
                 if let Ok(elapsed) = SystemTime::now().duration_since(last) {
                     if elapsed < interval {
                         return Ok(());
